@@ -3,12 +3,13 @@ import yaml
 import logging
 from typing import List, Union
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_community.vectorstores import FAISS
+from langchain_community.vectorstores import Chroma
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.agents import AgentExecutor, create_react_agent
 from langchain.tools import Tool
 from langchain import hub
 from langchain_community.document_loaders import PyPDFLoader, DirectoryLoader
+from sentence_transformers import CrossEncoder
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -24,7 +25,12 @@ class AgenticRAGEngine:
             model=self.config["llm"]["model"],
             temperature=self.config["llm"]["temperature"]
         )
-        self.vector_store = None
+        self.persist_directory = self.config.get("vector_store", {}).get("persist_directory", "./chroma_db")
+        self.vector_store = Chroma(
+            persist_directory=self.persist_directory,
+            embedding_function=self.embeddings
+        )
+        self.reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
         self.agent_executor = None
 
     def ingest_documents(self, data_dir: str):
@@ -38,24 +44,48 @@ class AgenticRAGEngine:
         )
         texts = text_splitter.split_documents(documents)
         
-        self.vector_store = FAISS.from_documents(texts, self.embeddings)
-        logger.info("Vector store created successfully.")
+        self.vector_store = Chroma.from_documents(
+            texts, 
+            self.embeddings, 
+            persist_directory=self.persist_directory
+        )
+        logger.info(f"Vector store created and persisted at {self.persist_directory}")
+
+    def rerank_documents(self, query: str, docs: List):
+        if not docs:
+            return []
+        
+        doc_contents = [d.page_content for d in docs]
+        pairs = [[query, content] for content in doc_contents]
+        scores = self.reranker.predict(pairs)
+        
+        # Sort docs by score
+        scored_docs = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
+        return [d for score, d in scored_docs[:5]] # Return top 5
+
+    def self_rag_logic(self, query: str) -> str:
+        """Self-RAG logic: Retrieve -> Rerank -> Evaluate -> Refine."""
+        logger.info(f"Self-RAG: Processing query '{query}'")
+        
+        # 1. Retrieve
+        initial_docs = self.vector_store.similarity_search(query, k=10)
+        
+        # 2. Rerank
+        reranked_docs = self.rerank_documents(query, initial_docs)
+        context = "\n\n".join([d.page_content for d in reranked_docs])
+        
+        # 3. Evaluate and Generate (simplified Self-RAG loop)
+        prompt = f"System: Evaluate the context for relevance to the query. If relevant, synthesize a response. If not, state that more information is needed.\nQuery: {query}\nContext: {context}"
+        response = self.llm.invoke(prompt)
+        
+        return response.content
 
     def setup_agent(self):
-        if not self.vector_store:
-            raise ValueError("Vector store not initialized. Run ingest_documents first.")
-
-        retriever = self.vector_store.as_retriever()
-        
-        def retrieval_tool_func(query: str) -> str:
-            docs = retriever.get_relevant_documents(query)
-            return "\n\n".join([d.page_content for d in docs])
-
         tools = [
             Tool(
                 name="knowledge_base",
-                func=retrieval_tool_func,
-                description="Use this tool to retrieve information from the internal knowledge base."
+                func=self.self_rag_logic,
+                description="Use this tool to retrieve and synthesize information using Self-RAG logic."
             )
         ]
 
@@ -67,7 +97,7 @@ class AgenticRAGEngine:
             verbose=True,
             handle_parsing_errors=True
         )
-        logger.info("ReAct agent setup complete.")
+        logger.info("Agent setup complete with Self-RAG tools.")
 
     def query(self, user_input: str):
         if not self.agent_executor:
